@@ -1,12 +1,10 @@
 # Rewriting AnyDBC code in Julia 1.4.2
 # https://github.com/VigneshN1997/AnyDBC_C_Code/blob/master/anyDBC.cpp
 
-# Pkg.add("CSV")
-# Pkg.add("Distances")
-# Pkg.add("ProgressMetere")
 using CSV
 using Distances
 using ProgressMeter
+using ThreadPools
 
 global neighbourMap = Dict{Int, Set{Int}}()
 global rangeQueryPerformed = Set{Int}()
@@ -77,11 +75,8 @@ function performRangeQuery(index::Int64)::Set{Int64}
 	point_a = dataSet[index]
 	push!(rangeQueryPerformed, index)
 	neighbourPoints = Set{Int64}()
-	for i in 1:num_records
+	for i in setdiff(1:num_records, index)
 		point_b = dataSet[i]
-		if point_a == point_b
-			continue
-		end
 		dist = cust_distance(point_a, point_b)
 		if dist <= minDist
 			push!(neighbourPoints, i)
@@ -90,16 +85,14 @@ function performRangeQuery(index::Int64)::Set{Int64}
 	return neighbourPoints
 end
 
-function cust_append_ie(index::Int64, list::Vector{Int64})
-	itr = intersect(index, list)
-	if isempty(itr)
+function pushList(index::Int64, list::Vector{Int64})
+	if index ∉ list
 		push!(list, index)
 	end
 end
 
-function cust_append_set_ie(idx1::Int64, idx2::Int64, mapList::Dict{Int64, Set{Int64}})
-	itr = intersect(idx1, keys(mapList))
-	if isempty(itr)
+function pushDict(idx1::Int64, idx2::Int64, mapList::Dict{Int64, Set{Int64}})
+	if !haskey(mapList, idx1)
 		mapList[idx1] = Set{Int64}()
 	end
 	push!(mapList[idx1], idx2)
@@ -111,22 +104,17 @@ function assignStateNei(index::Int64, listOfNeighbors::Set{Int64})::Vector{Int64
 	if length(listOfNeighbors) >= minPts
 		coreList[index] = "PROCESSED"
 		delete!(borderList, index)
-
 		for nei in listOfNeighbors
-			cust_append_ie(nei, touchList)
-			cust_append_set_ie(nei, index, coreForPointMap)
-
-			it_rqp = intersect(nei, rangeQueryPerformed)
-			if isempty(it_rqp)
-				cust_append_set_ie(nei, index, neighbourMap)
+			pushList(nei, touchList)
+			pushDict(nei, index, coreForPointMap)
+			if nei ∉ rangeQueryPerformed
+				pushDict(nei, index, neighbourMap)
 				if length(neighbourMap) < minPts
-					itr = intersect(nei, keys(borderList))
-					if isempty(itr)
+					if !haskey(borderList, nei)
 						borderList[nei] = "PROCESSED"
 					end
 				else
-					itr_core = intersect(nei, keys(coreList))
-					if isempty(itr_core)
+					if !haskey(coreList, nei)
 						coreList[nei] = "UNPROCESSED"
 						delete!(borderList, nei)
 					end
@@ -137,13 +125,11 @@ function assignStateNei(index::Int64, listOfNeighbors::Set{Int64})::Vector{Int64
 		push!(noiseList, index)
 		delete!(neiNoise, index)
 		for nei in listOfNeighbors
-			cust_append_ie(nei, touchList)
-			itr_core = intersect(nei, keys(coreList))
-			itr = intersect(nei, keys(borderList))
-			if isempty(itr_core) && isempty(itr)
+			pushList(nei, touchList)
+			if !haskey(coreList, nei) && !haskey(borderList, nei)
 				push!(neiNoise, nei)
 			end
-			cust_append_set_ie(nei, index, neighbourMap)
+			pushDict(nei, index, neighbourMap)
 		end
 	end
 	return touchList
@@ -151,8 +137,7 @@ end
 
 function createPCIR(index::Int64)
 	# PCIR = Primitive circle
-	clusters[index] = Set{Int64}()
-	push!(clusters[index], index)
+	pushDict(index, index, clusters)
 end
 
 function ddcBetPCIR(core1::Int64, core2::Int64)::Int8
@@ -167,7 +152,6 @@ function ddcBetPCIR(core1::Int64, core2::Int64)::Int8
 	intersectionPoints = intersect(pointPCIR, neiPointPCIR)
 	coreListKeys = keys(coreList)
 	coreIntersectionPoints = intersect(intersectionPoints, coreListKeys)
-
 	if !isempty(coreIntersectionPoints) || ((dist > sqrt(3) * minDist) && (length(intersectionPoints) >= minPts))
 		return 0
 	elseif !isempty(intersectionPoints)
@@ -177,68 +161,57 @@ function ddcBetPCIR(core1::Int64, core2::Int64)::Int8
 	end
 end
 
-
 function connComp()
 	repComp = Set{Int64}()
 	empty!(visitedNode)
 	edgeYesKeys = keys(edgeYes)
+	edge_bar = Progress(length(edgeYesKeys), dt=0.1, desc="Connectivity...")
+	count = 0
 	for keys_itr in edgeYesKeys
-		visited_itr = intersect(keys_itr, keys(visitedNode))
-		if isempty(visited_itr)
+		if !haskey(visitedNode, keys_itr)
 			DFS(keys_itr, keys_itr)
 			push!(repComp, keys_itr)
 		end
-
+		count += 1
+		ProgressMeter.update!(edge_bar, count)
 	end
-
 	deleteClust = setdiff(edgeYesKeys, repComp)
 	for del_itr in deleteClust
 		delete!(clusters, del_itr)
 	end
 	empty!(edgeYes)
-	count = 0
-	edge_bar = Progress(length(visitedNode), dt=0.1, desc="Connectivity...")
 	for visited_itr in visitedNode
 		u = visited_itr[1]
 		rep = visited_itr[2]
-		for rep_itr in clusters[rep]
-			if rep_itr == u
-				continue
-			end
-			edgeNoItr = intersect(u, keys(edgeNo))
-			if !isempty(edgeNoItr)
+		rep_range = setdiff(clusters[rep], u)
+		for rep_itr in rep_range
+			if haskey(edgeNo, u)
 				delete!(edgeNo[u], rep_itr)
 			end
-			edgeWeakItr = intersect(u, keys(edgeWeak))
-			if !isempty(edgeWeakItr)
+			if haskey(edgeWeak, u)
 				delete!(edgeWeak[u], rep_itr)
 			end
 		end
-		edgeNoItr = intersect(u, keys(edgeNo))
-		if !isempty(edgeNoItr)
+		if haskey(edgeNo, u)
 			if isempty(edgeNo[u])
 				delete!(edgeNo, u)
 			end
 		end
-		edgeWeakItr = intersect(u, keys(edgeWeak))
-		if !isempty(edgeWeakItr)
+		if haskey(edgeWeak, u)
 			if isempty(edgeWeak[u])
 				delete!(edgeWeak, u)
 			end
 		end
-		count += 1
-		ProgressMeter.update!(edge_bar, count)
 	end
 end
 
 function DFS(u::Int, rep::Int)
 	visitedNode[u] = rep
-	for clus_itr in clusters[u]
-		push!(clusters[rep], clus_itr)
+	for v in clusters[u]
+		push!(clusters[rep], v)
 	end
 	for v in edgeYes[u]
-		visited_itr = intersect(v, keys(visitedNode))
-		if isempty(visited_itr)
+		if !haskey(visitedNode, v)
 			DFS(v, rep)
 		end
 	end
@@ -258,19 +231,16 @@ function calculateStatDegree()
 		noOfpointsInCluster = 0
 		empty!(alreadyCountedPoint)
 		for p in v
-			for nei_itr in neighbourMap[p]
-				al_itr = intersect(nei_itr, alreadyCountedPoint)
-				if isempty(al_itr)
+			for x in neighbourMap[p]
+				if x ∉ alreadyCountedPoint
 					noOfpointsInCluster += 1
-					range_itr = intersect(nei_itr, rangeQueryPerformed)
-					if isempty(range_itr)
+					if x ∉ rangeQueryPerformed
 						usizeList[k] += 1
 					end
-					border_itr = intersect(nei_itr, keys(borderList))
-					if !isempty(border_itr)
+					if haskey(borderList, x)
 						numBorderPoints[k] += 1
 					end
-					push!(alreadyCountedPoint, nei_itr)
+					append!(alreadyCountedPoint, x)
 				end
 			end
 		end
@@ -280,11 +250,9 @@ function calculateStatDegree()
 		u = clus_itr[1]
 		siValue = 0
 		degList[u] = 0
-		edgeWeakItr = intersect(u, keys(edgeWeak))
-		if !isempty(edgeWeakItr)
+		if haskey(edgeWeak, u)
 			for v in edgeWeak[u]
-				stat_itr = intersect(v, keys(statList))
-				if !isempty(stat_itr)
+				if haskey(statList, v)
 					degList[u] += statList[v]
 					siValue += 1
 				else
@@ -293,11 +261,9 @@ function calculateStatDegree()
 			end
 			degList[u] *= w
 		end
-		edgeUnknownItr = intersect(u, keys(edgeUnknown))
-		if !isempty(edgeUnknownItr)
+		if haskey(edgeUnknown, u)
 			for v in edgeUnknown[u]
-				stat_itr = intersect(v, keys(statList))
-				if !isempty(stat_itr)
+				if haskey(statList, v)
 					degList[u] += statList[v]
 					siValue += 1
 				else
@@ -314,17 +280,12 @@ end
 
 function calculateScore()::Vector{Int64}
 	scoreSet = Dict{Int64, Float64}()
-	unprocessedPoints = Set{Int64}()
-	range_ = Set(collect(1:num_records))
-
-	unprocessedPoints = setdiff(range_, rangeQueryPerformed)
+	unprocessedPoints = setdiff(1:num_records, rangeQueryPerformed)
 	unprocessedPoints1 = setdiff(unprocessedPoints, neiNoise)
 	cal_bar = Progress(length(unprocessedPoints1), dt=0.05, desc="Calculating scores...")
 	count = 0
 	for unp_itr in unprocessedPoints1
-		core_itr = intersect(unp_itr, keys(coreList))
-		border_itr = intersect(unp_itr, keys(borderList))
-		if !isempty(core_itr) || !isempty(border_itr)
+		if haskey(coreList, unp_itr) || haskey(borderList, unp_itr)
 			score = 0
 			for clus_itr in clusters
 				rep = clus_itr[1]
@@ -340,8 +301,7 @@ function calculateScore()::Vector{Int64}
 		count += 1
 		ProgressMeter.update!(cal_bar, count)
 	end
-	sorted_x = sort(collect(scoreSet), by=x->x[2])
-	# sorted_x = reverse(scoreSet)
+	sorted_x = sort(unique(scoreSet), by=x->x[2])
 	returnList = Vector{Int64}()
 	betaF = beta
 	size_sorted_x = length(sorted_x)
@@ -350,7 +310,7 @@ function calculateScore()::Vector{Int64}
 			betaF = size_sorted_x
 		end
 		for i in betaF:-1:1
-			push!(returnList, sorted_x[i][1])
+			append!(returnList, sorted_x[i][1])
 		end
 	end
 	return returnList
@@ -363,90 +323,74 @@ function dccBetPCLU(repClust1::Int64, repClust2::Int64)
 	formedYesEdge = false
 	formedWeakEdge = false
 	for core1 in clusters[repClust1]
-		for core2 in clusters[repClust2]
-			if core1 == core2
-				continue
-			end
+		core2_range = setdiff(clusters[repClust2], core1)
+		for core2 in core2_range
 			stat = ddcBetPCIR(core1, core2)
 			if stat == 0
 				formedYesEdge = true
-				cust_append_set_ie(repClust1, repClust2, edgeYes)
-				cust_append_set_ie(repClust2, repClust1, edgeYes)
+				pushDict(repClust1, repClust2, edgeYes)
+				pushDict(repClust2, repClust1, edgeYes)
 				if formedWeakEdge
-					delete!(edgeWeak[repClust1], repClust2)
-					if isempty(edgeWeak[repClust1])
-						delete!(edgeWeak, repClust1)
-					end
-					delete!(edgeWeak[repClust2], repClust1)
-					if isempty(edgeWeak[repClust2])
-						delete!(edgeWeak, repClust2)
-					end
+					clearPointPairs((repClust1, repClust2), edgeWeak)
 				end
 				return
 			elseif stat == 1
 				noCount += 1
 			elseif (stat == 2) && (!formedYesEdge)
 				formedWeakEdge = true
-				cust_append_set_ie(repClust1, repClust2, edgeWeak)
-				cust_append_set_ie(repClust2, repClust1, edgeWeak)
+				pushDict(repClust1, repClust2, edgeWeak)
+				pushDict(repClust2, repClust1, edgeWeak)
 			end
 		end
 	end
 	if (!formedWeakEdge && !formedYesEdge && (noCount == noOfSubClusters))
-		cust_append_set_ie(repClust1, repClust2, edgeNo)
-		cust_append_set_ie(repClust2, repClust1, edgeNo)
+		pushDict(repClust1, repClust2, edgeNo)
+		pushDict(repClust2, repClust1, edgeNo)
 	elseif (!formedWeakEdge && !formedYesEdge && (noCount != noOfSubClusters))
-		cust_append_set_ie(repClust1, repClust2, edgeUnknown)
-		cust_append_set_ie(repClust2, repClust1, edgeUnknown)
+		pushDict(repClust1, repClust2, edgeUnknown)
+		pushDict(repClust2, repClust1, edgeUnknown)
 	end
 end
 
 function updateStates()
 	popWeakUnknown = Vector{Int64}()
-	for clus_itr in clusters
-		k = clus_itr[1]
-		v = clus_itr[2]
+	for k in keys(clusters)
+		v = clusters[k]
 		usizeList[k] = 0
 		for p in v
 			for x in neighbourMap[p]
-				range_itr = intersect(x, rangeQueryPerformed)
-				if isempty(range_itr)
+				if x ∉ rangeQueryPerformed
 					usizeList[k] += 1
 				end
 			end
 		end
-		usize_itr = intersect(k, keys(usizeList))
-		if !isempty(usize_itr)
+		if haskey(usizeList, k)
 			if usizeList[k] == 0
-				for edgeWeakItr in edgeWeak
-					node = edgeWeakItr[1]
-					neiNodes = edgeWeakItr[2]
-					node_itr = intersect(k, neiNodes)
+				for node in keys(edgeWeak)
+					neiNodes = edgeWeak[node]
 					if k == node
 						for knode in neiNodes
-							cust_append_set_ie(k, knode, edgeNo)
-							cust_append_set_ie(knode, k, edgeNo)
+							pushDict(k, knode, edgeNo)
+							pushDict(knode, k, edgeNo)
 						end
-					elseif !isempty(node_itr)
+					elseif k ∈ neiNodes
 						delete!(edgeWeak[node], k)
 						if isempty(edgeWeak[node])
-							push!(popWeakUnknown, node)
+							append!(popWeakUnknown, node)
 						end
 					end
 				end
-				for edgeUnknownItr in edgeUnknown
-					node = edgeUnknownItr[1]
-					neiNodes = edgeUnknownItr[2]
-					node_itr = intersect(k, neiNodes)
+				for node in keys(edgeUnknown)
+					neiNodes = edgeUnknown[node]
 					if k == node
 						for knode in neiNodes
-							cust_append_set_ie(k, knode, edgeNo)
-							cust_append_set_ie(knode, k, edgeNo)
+							pushDict(k, knode, edgeNo)
+							pushDict(knode, k, edgeNo)
 						end
-					elseif !isempty(node_itr)
+					elseif k ∈ neiNodes
 						delete!(edgeUnknown[node], k)
 						if isempty(edgeUnknown[node])
-							push!(popWeakUnknown, node)
+							append!(popWeakUnknown, node)
 						end
 					end
 				end
@@ -462,30 +406,25 @@ function updateStates()
 end
 
 function processNoise(p::Int64)
-	core_itr = intersect(p, keys(coreList))
-	border_itr = intersect(p, keys(borderList))
-
 	coreListKeys = keys(coreList)
 	listOfNeighbors = neighbourMap[p]
 	intersect_keys = intersect(listOfNeighbors, coreListKeys)
-	if (!isempty(core_itr) || !isempty(border_itr))
-		push!(popFromNoise, p)
+	if haskey(coreList, p) || haskey(borderList, p)
+		append!(popFromNoise, p)
 	elseif !isempty(intersect_keys)
 		borderList[p] = "PROCCESSED"
-		push!(popFromNoise, p)
+		append!(popFromNoise, p)
 	else
 		for nei in neighbourMap[p]
-			range_itr = intersect(nei, rangeQueryPerformed)
-			if !isempty(range_itr)
+			if nei ∈ rangeQueryPerformed
 				listOfNeighbors = neighbourMap[nei]
 			else
 				listOfNeighbors = performRangeQuery(nei)
 				neighbourMap[nei] = listOfNeighbors
 			end
 			for neiN in listOfNeighbors
-				range_itr = intersect(neiN, rangeQueryPerformed)
-				if isempty(range_itr)
-					cust_append_set_ie(neiN, nei, neighbourMap)
+				if neiN ∉ rangeQueryPerformed
+					pushDict(neiN, nei, neighbourMap)
 					if length(neighbourMap[neiN]) >= minPts
 						coreList[neiN] = "UNPROCESSED"
 						delete!(borderList, neiN)
@@ -495,8 +434,8 @@ function processNoise(p::Int64)
 			if length(listOfNeighbors) >= minPts
 				coreList[nei] = "PROCESSED"
 				borderList[p] = "PROCESSED"
-				push!(popFromNoise, nei)
-				push!(popFromNoise, p)
+				append!(popFromNoise, nei)
+				append!(popFromNoise, p)
 				delete!(borderList, nei)
 				createPCIR(nei)
 				for repCore in keys(clusters)
@@ -512,7 +451,6 @@ end
 
 function processOutliers()
 	processNoise.(noiseList)
-
 	for p in popFromNoise
 		delete!(noiseList, p)
 		delete!(neiNoise, p)
@@ -520,47 +458,42 @@ function processOutliers()
 	empty!(popFromNoise)
 	listNei = Set{Int64}()
 	for p in neiNoise
-		core_itr = intersect(p, keys(coreList))
-		border_itr = intersect(p, keys(borderList))
-		if (!isempty(core_itr)) || (!isempty(border_itr))
-			push!(popFromNoise, p)
-			continue
-		end
-		range_itr = intersect(p, rangeQueryPerformed)
-		if !isempty(range_itr)
-			listNei = neighbourMap[p]
+		if haskey(coreList, p) || haskey(borderList, p)
+			append!(popFromNoise, p)
 		else
-			listNei = performRangeQuery(p)
-			neighbourMap[p] = listNei
-		end
-		isCore = false
-		if length(listNei) >= minPts
-			isCore = true
-			coreList[p] = "PROCESSED"
-			delete!(borderList, p)
-			push!(popFromNoise, p)
-			createPCIR(p)
-			for clus_itr in clusters
-				repCore = clus_itr[1]
-				if p != repCore
-					dccBetPCLU(repCore, p)
+			if p ∈ rangeQueryPerformed
+				listNei = neighbourMap[p]
+			else
+				listNei = performRangeQuery(p)
+				neighbourMap[p] = listNei
+			end
+			isCore = false
+			if length(listNei) >= minPts
+				isCore = true
+				coreList[p] = "PROCESSED"
+				delete!(borderList, p)
+				append!(popFromNoise, p)
+				createPCIR(p)
+				for repCore in keys(clusters)
+					if p != repCore
+						dccBetPCLU(repCore, p)
+					end
 				end
 			end
-		end
-		for nei in listNei
-			range_itr = intersect(nei, rangeQueryPerformed)
-			if isempty(range_itr)
-				cust_append_set_ie(nei, p, neighbourMap)
-				if length(neighbourMap[nei]) >= minPts
-					coreList[nei] = "UNPORCESSED"
-					delete!(borderList, nei)
+			for nei in listNei
+				if nei ∉ rangeQueryPerformed
+					pushDict(nei, p, neighbourMap)
+					if length(neighbourMap[nei]) >= minPts
+						coreList[nei] = "UNPORCESSED"
+						delete!(borderList, nei)
+					end
+				end
+				if isCore
+					borderList[nei] = "UNPORCESSED"
 				end
 			end
-			if isCore
-				borderList[nei] = "UNPORCESSED"
-			end
+			processNoise(p)
 		end
-		processNoise(p)
 	end
 	for p in popFromNoise
 		delete!(noiseList, p)
@@ -569,154 +502,128 @@ function processOutliers()
 	empty!(popFromNoise)
 end
 
+function clearPointPairs(pt_pair, edge)
+	point, neipoint = pt_pair
+	delete!(edge[point], neipoint)
+	if isempty(edge[point])
+		delete!(edge, point)
+	end
+	delete!(edge[neipoint], point)
+	if isempty(edge[neipoint])
+		delete!(edge, neipoint)
+	end
+end
 
 function mergeAssignNewEdge()
+	itr_del = Vector{Tuple{Int64, Int64}}()
 	empty!(edgeUnknown)
-	edgeWeakBckupKeys = keys(edgeWeakBckup)
-	edgeNoBckupKeys = keys(edgeNoBckup)
-	eWN = union(edgeWeakBckupKeys, edgeNoBckupKeys)
+	eWN = union(keys(edgeWeakBckup), keys(edgeNoBckup))
 	doneClusters = Set{Int64}()
-	clus_bar = Progress(length(clusters), dt=0.1, desc="Merging edges...")
-	count = 0
-	for itr_clus1 in clusters
-		k = itr_clus1[1]
-
+	clustersKeys = keys(clusters)
+	for k in clustersKeys
+		clus_bar = Progress(length(clusters), desc="Merging edges...#$k ")
+		count = 0
+		ProgressMeter.update!(clus_bar, count)
 		v1_1 = clusters[k]
 		v1 = setdiff(v1_1, eWN)
 		push!(doneClusters, k)
-		for itr_clus2 in clusters
-			k2 = itr_clus2[1]
-			doneClusters_itr = intersect(k2, doneClusters)
-			if !isempty(doneClusters_itr)
-				continue
-			end
-
-			v2_1 = clusters[k2]
-			v2 = setdiff(v2_1, eWN)
-			weakPresent = 0
-			noCount = 0
-			noOfSubClusters = length(v1_1) * length(v2)
-			for point in v1_1
-				for neipoint in v2
-					itr_point = intersect(point, keys(edgeWeak))
-					itr_pointe = intersect(point, keys(edgeWeakBckup))
-					if !isempty(itr_point)
-						itr_neipoint = intersect(neipoint, edgeWeak[point])
-						if !isempty(itr_neipoint)
-							weakPresent = 1
-							delete!(edgeWeak[point], itr_neipoint)
-							delete!(edgeWeak[neipoint], point)
-							if isempty(edgeWeak[point])
-								delete!(edgeWeak, itr_point)
+		for k2 in clustersKeys
+			if k2 ∉ doneClusters
+				v2_1 = clusters[k2]
+				v2 = setdiff(v2_1, eWN)
+				weakPresent = 0
+				noCount = 0
+				noOfSubClusters = length(v1_1) * length(v2)
+				for point in v1_1
+					for neipoint in v2
+						if haskey(edgeWeak, point)
+							if neipoint ∈ edgeWeak[point]
+								weakPresent = 1
+								clearPointPairs((point, neipoint), edgeWeak)
+								pushDict(point, neipoint, edgeWeakBckup)
+								pushDict(neipoint, point, edgeWeakBckup)
 							end
-							if isempty(edgeWeak[neipoint])
-								delete!(edgeWeak, neipoint)
+						elseif haskey(edgeWeakBckup, point)
+							if neipoint ∈ edgeWeakBckup[point]
+								weakPresent = 1
 							end
-							cust_append_set_ie(point, neipoint, edgeWeakBckup)
-							cust_append_set_ie(neipoint, point, edgeWeakBckup)
 						end
-					elseif !isempty(itr_pointe)
-						itr_neipoint = intersect(neipoint, edgeWeakBckup[point])
-						if !isempty(itr_neipoint)
-							weakPresent = 1
-						end
-					end
-					itr_point = intersect(point, keys(edgeNo))
-					itr_pointe = intersect(point, keys(edgeNoBckup))
-					if !isempty(itr_point)
-						itr_neipoint = intersect(neipoint, edgeNo[point])
-						if !isempty(itr_neipoint)
-							noCount += 1
-							delete!(edgeNo[point], neipoint)
-							delete!(edgeNo[neipoint], point)
-							if isempty(edgeNo[point])
-								delete!(edgeNo, point)
+						if haskey(edgeNo, point)
+							if neipoint ∈ edgeNo[point]
+								noCount += 1
+								clearPointPairs((point, neipoint), edgeNo)
+								pushDict(point, neipoint, edgeNoBckup)
+								pushDict(neipoint, point, edgeNoBckup)
 							end
-							if isempty(edgeNo[neipoint])
-								delete!(edgeNo, neipoint)
+						elseif haskey(edgeNoBckup, point)
+							if neipoint ∈ edgeNoBckup[point]
+								noCount += 1
 							end
-							cust_append_set_ie(point, neipoint, edgeNoBckup)
-							cust_append_set_ie(neipoint, point, edgeNoBckup)
-						end
-					elseif !isempty(itr_pointe)
-						itr_neipoint = intersect(neipoint, edgeNoBckup[point])
-						if !isempty(itr_neipoint)
-							noCount += 1
 						end
 					end
 				end
-			end
-			if weakPresent == 1
-				cust_append_set_ie(k, k2, edgeWeak)
-				cust_append_set_ie(k2, k, edgeWeak)
-			elseif noCount == noOfSubClusters
-				if (v2 == v2_1) && (v1 == v1_1)
-					cust_append_set_ie(k, k2, edgeNo)
-					cust_append_set_ie(k2, k, edgeNo)
-					var = (k, k2)
-					noStatusLastIteration[var] = noCount
+				if weakPresent == 1
+					pushDict(k, k2, edgeWeak)
+					pushDict(k2, k, edgeWeak)
+				elseif noCount == noOfSubClusters
+					if (v2 == v2_1) && (v1 == v1_1)
+						pushDict(k, k2, edgeNo)
+						pushDict(k2, k, edgeNo)
+						var = (k, k2)
+						noStatusLastIteration[var] = noCount
+					else
+						noCountNew = 0
+						old2 = setdiff(v2_1, v2)
+						old1 = setdiff(v1_1, v1)
+						for point in old2
+							for neipoint in v1
+								if haskey(edgeNo, point)
+									if neipoint ∈ edgeNo[point]
+										noCountNew += 1
+										clearPointPairs((point, neipoint), edgeNo)
+										pushDict(point, neipoint, edgeNoBckup)
+										pushDict(neipoint, point, edgeNoBckup)
+									end
+								elseif haskey(edgeNoBckup, point)
+									if haskey(edgeNoBckup, neipoint)
+										noCountNew += 1
+									end
+								end
+								for p in old1
+									pair1 = (point, p)
+									pair2 = (p, point)
+									if pair1 in keys(noStatusLastIteration)
+										noCount += noStatusLastIteration[pair1]
+										push!(itr_del, pair1)
+									elseif pair2 in keys(noStatusLastIteration)
+										noCount += noStatusLastIteration[pair2]
+										push!(itr_del, pair2)
+									end
+								end
+							end
+						end
+						for ptx in itr_del
+							delete!(noStatusLastIteration, ptx)
+						end
+						if noCountNew == (length(v1) * length(old2))
+							totalClust = noCount + noCountNew
+							if totalClust == (length(v1_1) * length(v2_1))
+								pushDict(k, k2, edgeNo)
+								pushDict(k2, k, edgeNo)
+								var = (k, k2)
+								noStatusLastIteration[var] = totalClust
+							end
+						end
+					end
 				else
-					noCountNew = 0
-					old2 = setdiff(v2_1, v2)
-					old1 = setdiff(v1_1, v1)
-					for point in old2
-						for neipoint in v1
-							itr_point = intersect(point, keys(edgeNo))
-							itr_pointe = intersect(point, keys(edgeNoBckup))
-							if !isempty(itr_point)
-								itr_neipoint = intersect(neipoint, edgeNo[point])
-								if !isempty(itr_neipoint)
-									noCountNew += 1
-									delete!(edgeNo[point], neipoint)
-									delete!(edgeNo[neipoint], point)
-									if isempty(edgeNo[point])
-										delete!(edgeNo, point)
-									end
-									if isempty(edgeNo[neipoint])
-										delete!(edgeNo, neipoint)
-									end
-									cust_append_set_ie(point, neipoint, edgeNoBckup)
-									cust_append_set_ie(neipoint, point, edgeNoBckup)
-								end
-							elseif !isempty(itr_pointe)
-								itr_neipoint = intersect(neipoint, keys(edgeNoBckup))
-								if !isempty(itr_neipoint)
-									noCountNew += 1
-								end
-							end
-							for p in old1
-								pair1 = (point, p)
-								pair2 = (p, point)
-								if pair1 in keys(noStatusLastIteration)
-									noCount += noStatusLastIteration[pair1]
-									delete!(noStatusLastIteration, pair1)
-								elseif pair2 in keys(noStatusLastIteration)
-									noCount += noStatusLastIteration[pair2]
-									delete!(noStatusLastIteration, pair2)
-								end
-							end
-						end
-					end
-					if (noCountNew == length(v1) * length(old2))
-						totalClust = noCount + noCountNew
-						if totalClust == length(v1_1) * length(v2_1)
-							cust_append_set_ie(k, k2, edgeNo)
-							cust_append_set_ie(k2, k, edgeNo)
-							var = (k, k2)
-							noStatusLastIteration[var] = totalClust
-						end
-					end
+					pushDict(k, k2, edgeUnknown)
+					pushDict(k2, k, edgeUnknown)
 				end
-			else
-				cust_append_set_ie(k, k2, edgeUnknown)
-				cust_append_set_ie(k2, k, edgeUnknown)
 			end
-			count += 1/clusters
+			count += 1
+			ProgressMeter.update!(clus_bar, count)
 		end
-		count += 1
-		ProgressMeter.update!(clus_bar, count)
 	end
-	ProgressMeter.update!(clus_bar, length(clusters))
 	edgeWeakKeys = keys(edgeWeak)
 	edgeNoKeys = keys(edgeNo)
 	edgeUnknownKeys = keys(edgeUnknown)
@@ -735,7 +642,6 @@ function mergeAssignNewEdge()
 	end
 end
 
-
 function stoppingCondition()::Bool
 	if !isempty(edgeWeak) || !isempty(edgeUnknown)
 		return true
@@ -748,7 +654,6 @@ function anyDBC()
 	println("Step #1 rangeQuery on initial alpha points---")
 	start_time = time()
 	untouchedList = collect(1:num_records)
-
 	chunkSize = 10
 	chunkBlock = collect(1:Int64(round(num_records÷chunkSize)):num_records)[2:end-1]
 	p_bar = Progress(num_records, dt=0.1, desc="Initial rangeQuery...")
@@ -756,20 +661,14 @@ function anyDBC()
 	while !isempty(untouchedList)
 		randomPoints = getRandomPoints(untouchedList)
 		for point in randomPoints
-			itr = intersect(point, untouchedList)
-			if !isempty(itr)
-				for j in itr
-					deleteat!(untouchedList, findall(x->x == j, untouchedList))
-				end
+			if point ∈ untouchedList
+				setdiff!(untouchedList, point)
 				neighbours_of_point = performRangeQuery(point)
 				touch = assignStateNei(point, neighbours_of_point)
-				itr_core = intersect(point, keys(coreList))
-				if !isempty(itr_core)
+				if haskey(coreList, point)
 					createPCIR(point)
 				end
-				for j in touch
-					deleteat!(untouchedList, findall(x->x == j, untouchedList))
-				end
+				setdiff!(untouchedList, touch)
 			end
 		end
 		ProgressMeter.update!(p_bar, num_records - length(untouchedList))
@@ -782,28 +681,25 @@ function anyDBC()
 	println("Initial count of range queries: ", length(rangeQueryPerformed), "\n")
 	println("Step #2 Finding edges between clusters---")
 	p_bar = Progress(length(clusters), dt=0.1, desc="Finding edges...")
-	for itr_clus1 in clusters
-		point = itr_clus1[1]
+	clusters_keys = keys(clusters)
+	for point in clusters_keys
 		push!(donePoints, point)
-		for itr_clus2 in clusters
-			neiPoint = itr_clus2[1]
-			itr_done = intersect(neiPoint, donePoints)
-			if !isempty(itr_done)
-				continue
-			end
-			stat = ddcBetPCIR(point, neiPoint)
-			if stat == 1
-				cust_append_set_ie(point, neiPoint, edgeNo)
-				cust_append_set_ie(neiPoint, point, edgeNo)
-			elseif stat == 0
-				cust_append_set_ie(point, neiPoint, edgeYes)
-				cust_append_set_ie(neiPoint, point, edgeYes)
-			elseif stat == 2
-				cust_append_set_ie(point, neiPoint, edgeWeak)
-				cust_append_set_ie(neiPoint, point, edgeWeak)
-			elseif stat == 3
-				cust_append_set_ie(point, neiPoint, edgeUnknown)
-				cust_append_set_ie(neiPoint, point, edgeUnknown)
+		for neiPoint in clusters_keys
+			if neiPoint ∉ donePoints
+				stat = ddcBetPCIR(point, neiPoint)
+				if stat == 1
+					pushDict(point, neiPoint, edgeNo)
+					pushDict(neiPoint, point, edgeNo)
+				elseif stat == 0
+					pushDict(point, neiPoint, edgeYes)
+					pushDict(neiPoint, point, edgeYes)
+				elseif stat == 2
+					pushDict(point, neiPoint, edgeWeak)
+					pushDict(neiPoint, point, edgeWeak)
+				elseif stat == 3
+					pushDict(point, neiPoint, edgeUnknown)
+					pushDict(neiPoint, point, edgeUnknown)
+				end
 			end
 		end
 		ProgressMeter.update!(p_bar, length(donePoints))
@@ -851,8 +747,7 @@ function anyDBC()
 			println("Step #7 rangeQuery on beta points, and create clusters and edges---")
 			start_time = time()
 			for point in betaPoints
-				range_itr = intersect(point, rangeQueryPerformed)
-				if !isempty(range_itr)
+				if point ∈ rangeQueryPerformed
 					listOfNeighbors = neighbourMap[point]
 				else
 					listOfNeighbors = performRangeQuery(point)
@@ -860,33 +755,27 @@ function anyDBC()
 				if length(listOfNeighbors) < minPts
 					borderList[point] = "PROCESSED"
 					for nei in listOfNeighbors
-						range_itr = intersect(nei, rangeQueryPerformed)
-						if isempty(range_itr)
-							cust_append_set_ie(nei, point, neighbourMap)
+						if nei ∉ rangeQueryPerformed
+							pushDict(nei, point, neighbourMap)
 						end
 					end
 				else
 					coreList[point] = "PROCESSED"
 					delete!(borderList, point)
 					for nei in listOfNeighbors
-						cust_append_set_ie(nei, point, coreForPointMap)
-						cfpm_itr = intersect(nei, keys(coreForPointMap))
-						range_itr = intersect(nei, rangeQueryPerformed)
-						if isempty(range_itr)
-							cust_append_set_ie(nei, point, neighbourMap)
+						pushDict(nei, point, coreForPointMap)
+						if nei ∉ rangeQueryPerformed
+							pushDict(nei, point, neighbourMap)
 							if length(neighbourMap[nei]) < minPts
-								border_itr = intersect(nei, keys(borderList))
-								if isempty(border_itr)
-									range_itr = intersect(nei, rangeQueryPerformed)
-									if !isempty(range_itr)
+								if !haskey(borderList, nei)
+									if nei ∈ rangeQueryPerformed
 										borderList[nei] = "PROCESSED"
 									else
 										borderList[nei] = "UNPROCESSED"
 									end
 								end
 							else
-								core_itr = intersect(nei, keys(coreList))
-								if isempty(core_itr)
+								if !haskey(coreList, nei)
 									coreList[nei] = "UNPROCESSED"
 									delete!(borderList, nei)
 								end
@@ -894,8 +783,7 @@ function anyDBC()
 						end
 					end
 					createPCIR(point)
-					for clus_itr in clusters
-						repCore = clus_itr[1]
+					for repCore in keys(clusters)
 						if point != repCore
 							dccBetPCLU(repCore, point)
 						end
@@ -911,7 +799,6 @@ function anyDBC()
 				temp_time = round(time() - start_time, digits=3)
 				timeElapsed += temp_time
 				println("Step #7 Finding Connected Components\n---Time used: ", temp_time, " seconds ------Total time elapsed: ", round(timeElapsed, digits=3), " seconds ---")
-
 				start_time = time()
 				mergeAssignNewEdge()
 				temp_time = round(time() - start_time, digits=3)
@@ -955,19 +842,16 @@ function anyDBC()
 	println("CoreList : ", length(coreList), "\n")
 	println("BorderList : ", length(borderList), "\n")
 	println("NoiseList : ", length(noiseList) + length(neiNoise), "\n")
-	range = Set()
-	diff = Set()
-	range = Set(collect(1:num_records))
-	diff = setdiff(range, rangeQueryPerformed)
+	diff = setdiff(1:num_records, rangeQueryPerformed)
 	println("Unprocessed Points : ", length(diff), "\n")
 	println("No. of Clusters : ", length(clusters), "\n")
 end
 
 function main(argv)
+	println("\n-----AnyDBC Start------\n")
 	s_time = time()
 	file_name = argv
 	global dataSet = readData(file_name)
-	println("\n-----AnyDBC Start------\n")
 	temp_time = time() - s_time
 	println("Step #0 Read data---Time used: ", round(temp_time, digits=3), " seconds ---")
 	global timeElapsed += temp_time
